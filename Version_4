@@ -1,6 +1,6 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -8,67 +8,86 @@
 #include <pwd.h>
 #include <limits.h>
 #include <signal.h>
-#include <readline/readline.h>
-#include <readline/history.h>
 
 #define MAX_LEN 512
 #define MAXARGS 10
 #define ARGLEN 30
 #define HISTORY_SIZE 10
 
-char* command_history[HISTORY_SIZE];
-int history_count = 0;
-
 void sigchld_handler(int signo);
 int execute(char* arglist[], char* input_file, char* output_file, int background);
 char** tokenize(char* cmdline);
-char* read_cmd(char* prompt);
+char* read_cmd(char* prompt, FILE* fp);
 void handle_pipe(char* cmdline);
 void parse_redirects(char* cmdline, char** arglist, char** input_file, char** output_file);
-void add_to_history(const char* cmdline);
-void repeat_command(int num);
+
+char* history[HISTORY_SIZE]; // History buffer
+int history_index = 0;       // Index for circular history buffer
+int history_count = 0;       // Total number of commands in history
+
+void add_to_history(char* cmd) {
+    if (history[history_index]) {
+        free(history[history_index]); // Free the oldest command in circular buffer
+    }
+    history[history_index] = strdup(cmd); // Add new command to history
+    history_index = (history_index + 1) % HISTORY_SIZE; // Move index
+    if (history_count < HISTORY_SIZE) history_count++; // Track up to HISTORY_SIZE
+}
+
+char* get_history_command(int index) {
+    if (index == -1) {
+        index = history_count - 1; // Get last command
+    } else {
+        index--; // Convert 1-based to 0-based
+    }
+    
+    if (index < 0 || index >= history_count) {
+        return NULL; // Invalid command number
+    }
+    
+    // Return a copy of the command to safely manage memory
+    return strdup(history[(history_index + HISTORY_SIZE - history_count + index) % HISTORY_SIZE]);
+}
 
 int main() {
     struct sigaction sa;
-    sa.sa_handler = sigchld_handler; // Handle child termination
+    sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; // Restart functions if interrupted and do not count stopped children
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
 
     char *cmdline;
 
     while (1) {
-        // Generate and display the prompt with current directory and username
         char prompt[100];
         char cwd[PATH_MAX];
-        getcwd(cwd, sizeof(cwd)); // Get current working directory
-        struct passwd *pw = getpwuid(getuid()); // Get user information
+        getcwd(cwd, sizeof(cwd));
+        struct passwd *pw = getpwuid(getuid());
         char *username = pw->pw_name;
-
-        // Create a prompt string
         snprintf(prompt, sizeof(prompt), "PUCITshell: %s@%s$ ", username, cwd);
-        
-        // Read command line input using readline
-        cmdline = read_cmd(prompt);
+
+        cmdline = read_cmd(prompt, stdin);
+
         if (cmdline == NULL) {
-            break; // Exit on EOF (CTRL+D)
+            break;
         }
 
-        // Add command to history
-        add_to_history(cmdline);
-
-        // Handle command repetition
         if (cmdline[0] == '!') {
-            int command_num = atoi(cmdline + 1);
-            repeat_command(command_num);
-            free(cmdline); // Free the command line input
-            continue; // Skip to the next iteration
+            int cmd_num = atoi(cmdline + 1);
+            free(cmdline); // Free original cmdline to prevent memory leak
+            cmdline = get_history_command(cmd_num);
+
+            if (cmdline == NULL) {
+                printf("No command found in history.\n");
+                continue;
+            }
+            printf("Repeating command: %s\n", cmdline);
+        } else {
+            add_to_history(cmdline);
         }
 
-        // Handle pipes if present
         handle_pipe(cmdline);
-
-        free(cmdline); // Free command line input
+        free(cmdline); // Free after processing
     }
 
     printf("\nExiting shell.\n");
@@ -76,40 +95,7 @@ int main() {
 }
 
 void sigchld_handler(int signo) {
-    // Reap dead processes to prevent zombies
     while (waitpid(-1, NULL, WNOHANG) > 0);
-}
-
-void add_to_history(const char* cmdline) {
-    // Add command to history array, maintaining only the last 10 commands
-    if (history_count < HISTORY_SIZE) {
-        command_history[history_count] = strdup(cmdline); // Duplicate the command
-        history_count++;
-    } else {
-        free(command_history[0]); // Free the oldest command
-        for (int i = 1; i < HISTORY_SIZE; i++) {
-            command_history[i - 1] = command_history[i]; // Shift commands up
-        }
-        command_history[HISTORY_SIZE - 1] = strdup(cmdline); // Add the new command
-    }
-}
-
-void repeat_command(int num) {
-    int index;
-    if (num == -1) {
-        index = history_count - 1; // Last command
-    } else if (num > 0 && num <= history_count) {
-        index = num - 1; // User specified command number
-    } else {
-        printf("No such command in history.\n");
-        return;
-    }
-
-    if (index >= 0 && index < history_count) {
-        printf("Repeating command: %s\n", command_history[index]);
-        // Execute the command
-        handle_pipe(command_history[index]);
-    }
 }
 
 void handle_pipe(char* cmdline) {
@@ -117,13 +103,12 @@ void handle_pipe(char* cmdline) {
     char* cmd2 = strtok(NULL, "|");
 
     if (cmd2 != NULL) {
-        // Handle the case for two commands connected by a pipe
         int pipefd[2];
-        pipe(pipefd); // Create a pipe
+        pipe(pipefd);
 
-        if (fork() == 0) { // Child process for the first command
-            dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe write end
-            close(pipefd[0]); // Close unused read end
+        if (fork() == 0) {
+            dup2(pipefd[1], STDOUT_FILENO);
+            close(pipefd[0]);
             char* arglist[MAXARGS + 1] = { NULL };
             char* input_file = NULL;
             char* output_file = NULL;
@@ -132,9 +117,9 @@ void handle_pipe(char* cmdline) {
             exit(0);
         }
 
-        if (fork() == 0) { // Child process for the second command
-            dup2(pipefd[0], STDIN_FILENO); // Redirect stdin to pipe read end
-            close(pipefd[1]); // Close unused write end
+        if (fork() == 0) {
+            dup2(pipefd[0], STDIN_FILENO);
+            close(pipefd[1]);
             char* arglist[MAXARGS + 1] = { NULL };
             char* input_file = NULL;
             char* output_file = NULL;
@@ -143,23 +128,20 @@ void handle_pipe(char* cmdline) {
             exit(0);
         }
 
-        close(pipefd[0]); // Close both ends in the parent
+        close(pipefd[0]);
         close(pipefd[1]);
-        wait(NULL); // Wait for both children
+        wait(NULL);
         wait(NULL);
     } else {
-        // No pipe, handle normally
         char* arglist[MAXARGS + 1] = { NULL };
         char* input_file = NULL;
         char* output_file = NULL;
-        int background = 0; // Background flag
+        int background = 0;
 
-        // Check for background execution
         if (strchr(cmdline, '&') != NULL) {
             background = 1;
-            // Remove '&' from the command line
             char* ampersand = strchr(cmdline, '&');
-            *ampersand = '\0'; // Null-terminate at '&'
+            *ampersand = '\0';
         }
 
         parse_redirects(cmdline, arglist, &input_file, &output_file);
@@ -170,18 +152,18 @@ void handle_pipe(char* cmdline) {
 int execute(char* arglist[], char* input_file, char* output_file, int background) {
     int status;
     pid_t cpid = fork();
-    
+
     if (cpid == -1) {
         perror("fork failed");
         exit(1);
-    } else if (cpid == 0) { // Child process
+    } else if (cpid == 0) {
         if (input_file != NULL) {
             int fd_in = open(input_file, O_RDONLY);
             if (fd_in < 0) {
                 perror("Input file error");
                 exit(1);
             }
-            dup2(fd_in, STDIN_FILENO); // Redirect stdin
+            dup2(fd_in, STDIN_FILENO);
             close(fd_in);
         }
 
@@ -191,19 +173,19 @@ int execute(char* arglist[], char* input_file, char* output_file, int background
                 perror("Output file error");
                 exit(1);
             }
-            dup2(fd_out, STDOUT_FILENO); // Redirect stdout
+            dup2(fd_out, STDOUT_FILENO);
             close(fd_out);
         }
 
-        execvp(arglist[0], arglist); // Execute the command
-        perror("Command not found..."); // If exec fails
-        exit(1); // Exit child process if exec fails
-    } else { // Parent process
+        execvp(arglist[0], arglist);
+        perror("Command not found...");
+        exit(1);
+    } else {
         if (background) {
-            printf("[%d] %d\n", getpid(), cpid); // Display PID of background process
-            return 0; // Return without waiting
+            printf("[%d] %d\n", getpid(), cpid);
+            return 0;
         } else {
-            waitpid(cpid, &status, 0); // Wait for child process to finish
+            waitpid(cpid, &status, 0);
             printf("Child exited with status %d\n", status >> 8);
         }
     }
@@ -216,29 +198,41 @@ void parse_redirects(char* cmdline, char** arglist, char** input_file, char** ou
 
     while (token != NULL) {
         if (strcmp(token, "<") == 0) {
-            token = strtok(NULL, " "); // Get the next token for the input file
+            token = strtok(NULL, " ");
             if (token != NULL) {
                 *input_file = token;
             }
         } else if (strcmp(token, ">") == 0) {
-            token = strtok(NULL, " "); // Get the next token for the output file
+            token = strtok(NULL, " ");
             if (token != NULL) {
                 *output_file = token;
             }
         } else {
-            arglist[argnum++] = token; // Store the command or argument
+            arglist[argnum++] = token;
         }
         token = strtok(NULL, " ");
     }
 
-    arglist[argnum] = NULL; // Null-terminate the argument list
+    arglist[argnum] = NULL;
 }
 
-char* read_cmd(char* prompt) {
-    char *input = readline(prompt); // Read command with readline for history support
-    if (input && *input) {
-        add_history(input); // Add to history if not empty
+char* read_cmd(char* prompt, FILE* fp) {
+    printf("%s", prompt);
+    int c;
+    int pos = 0;
+    char* cmdline = (char*)malloc(sizeof(char) * MAX_LEN);
+    if (!cmdline) return NULL;
+
+    while ((c = getc(fp)) != EOF) {
+        if (c == '\n') break;
+        cmdline[pos++] = c;
     }
-    return input;
-}
 
+    if (c == EOF && pos == 0) {
+        free(cmdline);
+        return NULL;
+    }
+
+    cmdline[pos] = '\0';
+    return cmdline;
+}
